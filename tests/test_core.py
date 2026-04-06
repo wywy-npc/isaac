@@ -33,7 +33,7 @@ class TestTypes:
         cfg = AgentConfig(name="test")
         assert cfg.name == "test"
         assert cfg.model == "claude-sonnet-4-6"
-        assert cfg.max_iterations == 25
+        assert cfg.max_iterations == 0  # 0 = unlimited
         assert cfg.tools == ["*"]
 
     def test_message(self):

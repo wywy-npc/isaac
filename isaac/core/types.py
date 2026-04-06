@@ -65,7 +65,7 @@ class AgentConfig:
     model: str = "claude-sonnet-4-6"
     tools: list[str] = field(default_factory=lambda: ["*"])
     mcp_servers: list[str] = field(default_factory=list)
-    max_iterations: int = 25
+    max_iterations: int = 0  # 0 = unlimited. Agent runs until task is done.
     context_budget: int = 180_000
     cwd: str | None = None
     auto_start: bool = False

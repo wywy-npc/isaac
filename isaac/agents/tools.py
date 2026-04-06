@@ -107,14 +107,41 @@ def build_builtin_tools(
 
     # --- File tools ---
 
-    async def file_read(path: str) -> dict[str, Any]:
+    async def file_read(path: str, offset: int = 0, limit: int = 0) -> dict[str, Any]:
+        """Read a file. Supports pagination via offset (line number) and limit (line count)."""
         target = Path(path) if os.path.isabs(path) else Path(working_dir) / path
         if not target.exists():
             return {"error": f"File not found: {target}"}
         try:
             content = target.read_text()
-            if len(content) > 50_000:
-                content = content[:50_000] + "\n\n[... truncated ...]"
+            total_size = len(content)
+
+            # Line-based pagination if offset or limit specified
+            if offset > 0 or limit > 0:
+                lines = content.split("\n")
+                total_lines = len(lines)
+                start = min(offset, total_lines)
+                end = min(start + limit, total_lines) if limit > 0 else total_lines
+                content = "\n".join(lines[start:end])
+                return {
+                    "path": str(target),
+                    "content": content,
+                    "offset": start,
+                    "lines_returned": end - start,
+                    "total_lines": total_lines,
+                    "has_more": end < total_lines,
+                }
+
+            # Default: return up to 200KB
+            if total_size > 200_000:
+                content = content[:200_000]
+                return {
+                    "path": str(target),
+                    "content": content + "\n\n[... truncated ...]",
+                    "total_size": total_size,
+                    "truncated": True,
+                    "hint": "Use offset and limit params to read specific sections",
+                }
             return {"path": str(target), "content": content}
         except Exception as e:
             return {"error": str(e)}
@@ -122,10 +149,17 @@ def build_builtin_tools(
     registry["file_read"] = (
         ToolDef(
             name="file_read",
-            description="Read a file from the filesystem.",
+            description=(
+                "Read a file from the filesystem. Supports pagination: "
+                "use offset (line number) and limit (line count) for large files."
+            ),
             input_schema={
                 "type": "object",
-                "properties": {"path": {"type": "string", "description": "File path (absolute or relative to cwd)"}},
+                "properties": {
+                    "path": {"type": "string", "description": "File path (absolute or relative to cwd)"},
+                    "offset": {"type": "integer", "description": "Start reading from this line number (0-based)", "default": 0},
+                    "limit": {"type": "integer", "description": "Max lines to read (0 = all)", "default": 0},
+                },
                 "required": ["path"],
             },
             permission=PermissionLevel.AUTO,
@@ -163,7 +197,7 @@ def build_builtin_tools(
             return {"error": f"Directory not found: {target}"}
         files = sorted(str(p.relative_to(target)) for p in target.glob(pattern) if p.is_file())
         dirs = sorted(str(p.relative_to(target)) for p in target.iterdir() if p.is_dir())
-        return {"files": files[:100], "dirs": dirs[:50]}
+        return {"files": files[:500], "dirs": dirs[:100]}
 
     registry["file_list"] = (
         ToolDef(
@@ -182,30 +216,43 @@ def build_builtin_tools(
         file_list,
     )
 
-    async def file_search(pattern: str, path: str = ".") -> dict[str, Any]:
+    async def file_search(pattern: str, path: str = ".", include: str = "", max_results: int = 50) -> dict[str, Any]:
         target = Path(path) if os.path.isabs(path) else Path(working_dir) / path
         try:
+            cmd = ["grep", "-rl", "--binary-files=without-match"]
+            if include:
+                for ext in include.split(","):
+                    ext = ext.strip()
+                    if not ext.startswith("*."):
+                        ext = f"*.{ext}"
+                    cmd.extend(["--include", ext])
+            cmd.extend([pattern, str(target)])
             proc = await asyncio.create_subprocess_exec(
-                "grep", "-rl", "--include=*.py", "--include=*.md", "--include=*.yaml",
-                "--include=*.json", "--include=*.txt", "--include=*.ts", "--include=*.js",
-                pattern, str(target),
+                *cmd,
                 stdout=subprocess.PIPE, stderr=subprocess.PIPE,
             )
-            stdout, _ = await proc.communicate()
-            files = stdout.decode().strip().split("\n")[:20]
-            return {"matches": [f for f in files if f]}
+            stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=30)
+            files = stdout.decode().strip().split("\n")[:max_results]
+            return {"matches": [f for f in files if f], "count": len([f for f in files if f])}
+        except asyncio.TimeoutError:
+            return {"error": "Search timed out", "matches": []}
         except Exception as e:
             return {"error": str(e)}
 
     registry["file_search"] = (
         ToolDef(
             name="file_search",
-            description="Search file contents using grep. Returns matching file paths.",
+            description=(
+                "Search file contents using grep. Returns matching file paths. "
+                "Searches all text files by default. Use include to filter by extension (e.g. 'py,ts,go')."
+            ),
             input_schema={
                 "type": "object",
                 "properties": {
                     "pattern": {"type": "string", "description": "Search pattern (regex)"},
                     "path": {"type": "string", "description": "Directory to search in", "default": "."},
+                    "include": {"type": "string", "description": "Comma-separated file extensions to search (e.g. 'py,ts,go'). Empty = all text files."},
+                    "max_results": {"type": "integer", "description": "Max files to return", "default": 50},
                 },
                 "required": ["pattern"],
             },
@@ -217,7 +264,7 @@ def build_builtin_tools(
 
     # --- Shell tool ---
 
-    async def bash(command: str, timeout: int = 30) -> dict[str, Any]:
+    async def bash(command: str, timeout: int = 120) -> dict[str, Any]:
         try:
             proc = await asyncio.create_subprocess_shell(
                 command,
@@ -247,7 +294,7 @@ def build_builtin_tools(
                 "type": "object",
                 "properties": {
                     "command": {"type": "string", "description": "Shell command to execute"},
-                    "timeout": {"type": "integer", "description": "Timeout in seconds", "default": 30},
+                    "timeout": {"type": "integer", "description": "Timeout in seconds", "default": 120},
                 },
                 "required": ["command"],
             },
@@ -258,7 +305,8 @@ def build_builtin_tools(
 
     # --- Web search (DuckDuckGo free, Brave if API key set) ---
 
-    async def web_search(query: str) -> dict[str, Any]:
+    async def web_search(query: str, max_results: int = 10) -> dict[str, Any]:
+        max_results = min(max(1, max_results), 20)
         # Prefer Brave if key is set
         brave_key = os.environ.get("BRAVE_API_KEY")
         if brave_key:
@@ -267,12 +315,12 @@ def build_builtin_tools(
                 async with httpx.AsyncClient() as client:
                     resp = await client.get(
                         "https://api.search.brave.com/res/v1/web/search",
-                        params={"q": query, "count": 5},
+                        params={"q": query, "count": max_results},
                         headers={"X-Subscription-Token": brave_key},
                     )
                     data = resp.json()
                     results = []
-                    for r in data.get("web", {}).get("results", [])[:5]:
+                    for r in data.get("web", {}).get("results", [])[:max_results]:
                         results.append({
                             "title": r.get("title", ""),
                             "url": r.get("url", ""),
@@ -287,7 +335,7 @@ def build_builtin_tools(
             from duckduckgo_search import DDGS
             loop = asyncio.get_event_loop()
             raw = await loop.run_in_executor(
-                None, lambda: DDGS().text(query, max_results=5)
+                None, lambda: DDGS().text(query, max_results=max_results)
             )
             results = [
                 {"title": r.get("title", ""), "url": r.get("href", ""), "snippet": r.get("body", "")}
@@ -303,13 +351,215 @@ def build_builtin_tools(
             description="Search the web. Returns titles, URLs, and snippets.",
             input_schema={
                 "type": "object",
-                "properties": {"query": {"type": "string", "description": "Search query"}},
+                "properties": {
+                    "query": {"type": "string", "description": "Search query"},
+                    "max_results": {"type": "integer", "description": "Number of results (1-20)", "default": 10},
+                },
                 "required": ["query"],
             },
             permission=PermissionLevel.AUTO,
             is_read_only=True,
         ),
         web_search,
+    )
+
+    # --- Web fetch (read any URL) ---
+
+    async def web_fetch(url: str, extract: str = "text", max_bytes: int = 30000) -> dict[str, Any]:
+        """Fetch a URL and return its content. Handles HTML, JSON, plain text."""
+        try:
+            import httpx
+        except ImportError:
+            return {"error": "httpx not installed. Run: pip install httpx"}
+        try:
+            async with httpx.AsyncClient(follow_redirects=True, timeout=60) as client:
+                resp = await client.get(url, headers={
+                    "User-Agent": "Mozilla/5.0 (compatible; ISAAC/1.0; +https://github.com/isaac)",
+                })
+                content_type = resp.headers.get("content-type", "")
+                status = resp.status_code
+
+                if "application/json" in content_type:
+                    return {"url": url, "status": status, "content_type": "json", "content": resp.text[:max_bytes]}
+
+                if "text/plain" in content_type or "text/csv" in content_type:
+                    return {"url": url, "status": status, "content_type": "text", "content": resp.text[:max_bytes]}
+
+                # HTML → extract readable content
+                raw_html = resp.text
+                if extract == "raw":
+                    return {"url": url, "status": status, "content_type": "html", "content": raw_html[:max_bytes]}
+
+                # Lightweight HTML to text conversion
+                import re as _re
+                text = raw_html
+                # Remove script and style blocks
+                text = _re.sub(r'<script[^>]*>.*?</script>', '', text, flags=_re.DOTALL | _re.IGNORECASE)
+                text = _re.sub(r'<style[^>]*>.*?</style>', '', text, flags=_re.DOTALL | _re.IGNORECASE)
+                # Convert common elements
+                text = _re.sub(r'<br\s*/?>', '\n', text, flags=_re.IGNORECASE)
+                text = _re.sub(r'</(p|div|h[1-6]|li|tr)>', '\n', text, flags=_re.IGNORECASE)
+                text = _re.sub(r'<(h[1-6])[^>]*>', r'\n## ', text, flags=_re.IGNORECASE)
+                # Extract links if requested
+                links = []
+                if extract == "links":
+                    links = _re.findall(r'<a[^>]+href=["\']([^"\']+)["\'][^>]*>(.*?)</a>', raw_html, _re.IGNORECASE | _re.DOTALL)
+                    links = [{"url": u, "text": _re.sub(r'<[^>]+>', '', t).strip()} for u, t in links[:100]]
+                # Strip remaining tags
+                text = _re.sub(r'<[^>]+>', '', text)
+                # Collapse whitespace
+                text = _re.sub(r'\n{3,}', '\n\n', text)
+                text = _re.sub(r' {2,}', ' ', text)
+                text = text.strip()
+
+                result: dict[str, Any] = {"url": url, "status": status, "content_type": "html", "content": text[:max_bytes]}
+                if links:
+                    result["links"] = links
+                if len(text) > max_bytes:
+                    result["truncated"] = True
+                    result["total_chars"] = len(text)
+                return result
+        except Exception as e:
+            return {"error": str(e), "url": url}
+
+    registry["web_fetch"] = (
+        ToolDef(
+            name="web_fetch",
+            description=(
+                "Fetch and read a URL. Returns page content as text (HTML converted to readable text). "
+                "Use extract='links' to get all links, 'raw' for raw HTML. "
+                "Handles HTML, JSON, plain text. For paginated reading, use max_bytes offset."
+            ),
+            input_schema={
+                "type": "object",
+                "properties": {
+                    "url": {"type": "string", "description": "URL to fetch"},
+                    "extract": {"type": "string", "description": "Extraction mode: text (default), links, raw", "default": "text"},
+                    "max_bytes": {"type": "integer", "description": "Max content bytes to return (default 30000)", "default": 30000},
+                },
+                "required": ["url"],
+            },
+            permission=PermissionLevel.AUTO,
+            is_read_only=True,
+        ),
+        web_fetch,
+    )
+
+    # --- HTTP request (arbitrary API calls) ---
+
+    async def http_request(
+        url: str, method: str = "GET", headers: dict[str, str] | None = None,
+        body: str = "", content_type: str = "application/json", timeout: int = 60,
+    ) -> dict[str, Any]:
+        """Make an HTTP request. Supports all methods, custom headers, JSON/form body."""
+        try:
+            import httpx
+        except ImportError:
+            return {"error": "httpx not installed. Run: pip install httpx"}
+        try:
+            method = method.upper()
+            req_headers = dict(headers) if headers else {}
+            kwargs: dict[str, Any] = {"headers": req_headers, "timeout": timeout, "follow_redirects": True}
+
+            if body and method in ("POST", "PUT", "PATCH"):
+                if content_type == "application/json":
+                    kwargs["content"] = body
+                    req_headers.setdefault("Content-Type", "application/json")
+                elif content_type == "application/x-www-form-urlencoded":
+                    kwargs["content"] = body
+                    req_headers.setdefault("Content-Type", "application/x-www-form-urlencoded")
+                else:
+                    kwargs["content"] = body
+                    req_headers.setdefault("Content-Type", content_type)
+
+            async with httpx.AsyncClient() as client:
+                resp = await client.request(method, url, **kwargs)
+                resp_body = resp.text
+                if len(resp_body) > 30_000:
+                    resp_body = resp_body[:30_000] + "\n\n[... truncated ...]"
+                return {
+                    "status": resp.status_code,
+                    "headers": dict(resp.headers),
+                    "body": resp_body,
+                    "url": str(resp.url),
+                }
+        except Exception as e:
+            return {"error": str(e), "url": url}
+
+    registry["http_request"] = (
+        ToolDef(
+            name="http_request",
+            description=(
+                "Make an HTTP request to any URL. Supports GET, POST, PUT, PATCH, DELETE. "
+                "Use for REST API calls, webhooks, data fetching. "
+                "JSON body by default; set content_type for form data or other formats."
+            ),
+            input_schema={
+                "type": "object",
+                "properties": {
+                    "url": {"type": "string", "description": "Request URL"},
+                    "method": {"type": "string", "description": "HTTP method", "default": "GET"},
+                    "headers": {"type": "object", "description": "Request headers", "additionalProperties": {"type": "string"}},
+                    "body": {"type": "string", "description": "Request body (for POST/PUT/PATCH)"},
+                    "content_type": {"type": "string", "description": "Body content type", "default": "application/json"},
+                    "timeout": {"type": "integer", "description": "Timeout in seconds", "default": 60},
+                },
+                "required": ["url"],
+            },
+            permission=PermissionLevel.AUTO,
+        ),
+        http_request,
+    )
+
+    # --- File edit (surgical string replacement) ---
+
+    async def file_edit(path: str, old_text: str, new_text: str, replace_all: bool = False) -> dict[str, Any]:
+        """Surgical file edit — replace exact text without rewriting the whole file."""
+        target = Path(path) if os.path.isabs(path) else Path(working_dir) / path
+        if not target.exists():
+            return {"error": f"File not found: {target}"}
+        try:
+            content = target.read_text()
+            count = content.count(old_text)
+            if count == 0:
+                return {"error": "old_text not found in file", "path": str(target)}
+            if count > 1 and not replace_all:
+                return {
+                    "error": f"old_text found {count} times. Set replace_all=true to replace all, or provide more context to make it unique.",
+                    "count": count,
+                    "path": str(target),
+                }
+            if replace_all:
+                new_content = content.replace(old_text, new_text)
+            else:
+                new_content = content.replace(old_text, new_text, 1)
+            target.write_text(new_content)
+            return {"edited": str(target), "replacements": count if replace_all else 1}
+        except Exception as e:
+            return {"error": str(e)}
+
+    registry["file_edit"] = (
+        ToolDef(
+            name="file_edit",
+            description=(
+                "Surgical file edit — replace exact text in a file without rewriting the whole thing. "
+                "Provide old_text (must be unique in the file) and new_text. "
+                "Set replace_all=true to replace all occurrences. "
+                "Safer than file_write for modifying existing files."
+            ),
+            input_schema={
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string", "description": "File path"},
+                    "old_text": {"type": "string", "description": "Exact text to find and replace"},
+                    "new_text": {"type": "string", "description": "Replacement text"},
+                    "replace_all": {"type": "boolean", "description": "Replace all occurrences", "default": False},
+                },
+                "required": ["path", "old_text", "new_text"],
+            },
+            permission=PermissionLevel.AUTO,
+        ),
+        file_edit,
     )
 
     # --- Agent delegation tool (stub — wired to real delegation in terminal.py) ---
@@ -373,6 +623,51 @@ def build_builtin_tools(
         ),
         write_continuation,
     )
+
+    # --- Get full result (retrieve overflow tool results) ---
+
+    # Session-scoped overflow store — orchestrator writes here, agent reads back
+    _overflow_store: dict[str, str] = {}
+
+    async def get_full_result(tool_call_id: str, offset: int = 0, limit: int = 8000) -> dict[str, Any]:
+        """Retrieve the full content of a truncated tool result."""
+        if tool_call_id not in _overflow_store:
+            return {"error": f"No overflow result found for tool_call_id '{tool_call_id}'. It may have been cleared or the ID is wrong."}
+        full = _overflow_store[tool_call_id]
+        chunk = full[offset:offset + limit]
+        return {
+            "content": chunk,
+            "offset": offset,
+            "limit": limit,
+            "total_length": len(full),
+            "has_more": offset + limit < len(full),
+        }
+
+    registry["get_full_result"] = (
+        ToolDef(
+            name="get_full_result",
+            description=(
+                "Retrieve the full content of a truncated tool result. "
+                "When a tool result is too large, it gets truncated with a message pointing here. "
+                "Use the tool_call_id from the truncation message. Supports pagination with offset/limit."
+            ),
+            input_schema={
+                "type": "object",
+                "properties": {
+                    "tool_call_id": {"type": "string", "description": "The tool_call_id from the truncated result"},
+                    "offset": {"type": "integer", "description": "Character offset to start from", "default": 0},
+                    "limit": {"type": "integer", "description": "Max characters to return", "default": 8000},
+                },
+                "required": ["tool_call_id"],
+            },
+            permission=PermissionLevel.AUTO,
+            is_read_only=True,
+        ),
+        get_full_result,
+    )
+
+    # Expose the overflow store so the orchestrator can write to it
+    registry["_overflow_store"] = _overflow_store  # type: ignore[assignment]
 
     # --- E2B sandbox tools (only if E2B_API_KEY is set) ---
 
