@@ -125,6 +125,13 @@ class ModelRouteEvent(Event):
         self.reason = reason
 
 
+class ContinuationEvent(Event):
+    """Signals that the agent exhausted iterations but auto-saved state for re-dispatch."""
+    def __init__(self, continuation_path: str, what_remains: str) -> None:
+        self.continuation_path = continuation_path
+        self.what_remains = what_remains
+
+
 class Orchestrator:
     """The agentic loop. Streams events. Handles tool calls, permissions, compaction.
 
@@ -358,8 +365,15 @@ class Orchestrator:
 
         tools_used_since_checkin: list[str] = []
 
+        # --- Extract overflow store from tool registry (if present) ---
+        overflow_store: dict[str, str] | None = None
+        if "_overflow_store" in self.tools:
+            overflow_store = self.tools.pop("_overflow_store")  # type: ignore[assignment]
+
         # --- AGENTIC LOOP ---
-        for iteration in range(self.config.max_iterations):
+        # max_iterations=0 means unlimited — agent runs until end_turn or error
+        max_iter = self.config.max_iterations if self.config.max_iterations > 0 else 10_000
+        for iteration in range(max_iter):
             elapsed = time.time() - loop_start
 
             # --- PROGRESS CHECK-IN (every 3 iterations) ---
@@ -497,9 +511,11 @@ class Orchestrator:
                     if entry:
                         yield ApprovalEvent(payload, entry[0])
                 elif event_type == "result":
-                    # Overflow preview
+                    # Overflow preview — store full result for get_full_result tool
                     preview, overflowed = build_overflow_preview(payload.content)
                     if overflowed:
+                        if overflow_store is not None:
+                            overflow_store[payload.tool_call_id] = payload.content
                         payload = ToolResult(
                             tool_call_id=payload.tool_call_id,
                             content=preview,
@@ -522,7 +538,33 @@ class Orchestrator:
                 tool_results=results,
             ))
 
-        yield ErrorEvent(f"Hit max iterations ({self.config.max_iterations})")
+        # --- AUTO-CONTINUATION on iteration exhaustion ---
+        # Instead of just erroring, save state so the agent can be re-dispatched
+        try:
+            from isaac.core.heartbeat import write_continuation as _write_cont
+            import os as _os
+            agent_name = _os.environ.get("ISAAC_AGENT", self.config.name)
+
+            # Build summary from recent messages
+            recent_summary_parts: list[str] = []
+            for m in state.messages[-6:]:
+                if m.content:
+                    recent_summary_parts.append(f"[{m.role.value}] {m.content[:300]}")
+
+            cont_path = _write_cont(
+                agent_name,
+                what_was_done="\n".join(recent_summary_parts) or "Multiple iterations of work completed.",
+                what_remains="Task not yet complete — hit iteration limit. Re-dispatch to continue.",
+                blocking_on="Nothing — ready to continue.",
+                next_priority="Continue from where the previous session left off.",
+            )
+            yield ContinuationEvent(
+                continuation_path=cont_path,
+                what_remains="Task not yet complete — auto-saved state for re-dispatch.",
+            )
+        except Exception:
+            pass
+        yield ErrorEvent(f"Hit max iterations ({max_iter}). State auto-saved for continuation.")
 
     def generate_handoff(self, state: SessionState) -> Handoff:
         """Generate a handoff when session ends or context runs out."""

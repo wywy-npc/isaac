@@ -53,9 +53,9 @@ def estimate_messages_tokens(messages: list[Message]) -> int:
 
 CONTEXT_BUDGET_TOKENS = 180_000     # total context budget
 COMPACTION_THRESHOLD = 0.8          # compact when context hits 80% of budget
-MEMORY_SCOUT_BUDGET = 2000          # tokens for agent/company memory retrieval
-PERSONAL_SCOUT_BUDGET = 1000        # tokens for personal memory retrieval
-TOOL_RESULT_MAX_TOKENS = 2000       # overflow to preview above this
+MEMORY_SCOUT_BUDGET = 4000          # tokens for agent/company memory retrieval
+PERSONAL_SCOUT_BUDGET = 2000        # tokens for personal memory retrieval
+TOOL_RESULT_MAX_TOKENS = 4000       # overflow to preview above this
 MAX_RECENT_TURNS = 20               # keep last N turns uncompacted
 TOOL_DESC_MAX_CHARS = 150           # truncate tool descriptions in static layer
 COMPACTION_SUMMARY_MAX_TOKENS = 500 # max tokens for summarizer output
@@ -250,7 +250,8 @@ def build_overflow_preview(full_result: str, max_tokens: int = TOOL_RESULT_MAX_T
     preview = full_result[:preview_chars]
     preview += (
         f"\n\n[... truncated. Full result: {result_tokens} tokens. "
-        f"Use `get_full_result` tool to retrieve.]"
+        f"Use get_full_result(tool_call_id=<this_tool_call_id>) to retrieve the rest. "
+        f"Supports pagination with offset and limit params.]"
     )
     return preview, True
 

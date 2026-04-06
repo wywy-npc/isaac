@@ -281,6 +281,22 @@ class HarnessBuilder:
         # Extra tools (from caller)
         registry.update(self._extra_tools)
 
+        # --- Apply tool filter from agent config ---
+        # tools: ["*"] = all tools (default), otherwise filter by glob patterns
+        if self._config.tools and self._config.tools != ["*"]:
+            import fnmatch
+            allowed = set()
+            # Always keep internal entries (like _overflow_store)
+            for key in list(registry.keys()):
+                if key.startswith("_"):
+                    allowed.add(key)
+                    continue
+                for pattern in self._config.tools:
+                    if fnmatch.fnmatch(key, pattern):
+                        allowed.add(key)
+                        break
+            registry = {k: v for k, v in registry.items() if k in allowed}
+
         return registry
 
     async def _connect_mcp_services(self, registry: dict) -> Any:
