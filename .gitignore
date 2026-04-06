@@ -1,0 +1,16 @@
+__pycache__/
+*.pyc
+*.egg-info/
+dist/
+build/
+.eggs/
+.env
+.env.*
+!.env.example
+.venv/
+*.log
+sessions/
+.isaac/
+.pytest_cache/
+.claude/
+.ruff_cache/
