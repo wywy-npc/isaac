@@ -246,6 +246,13 @@ class HarnessBuilder:
             except Exception:
                 pass
 
+        # Spreadsheet tools (Excel/CSV read, write, edit, diff, convert)
+        try:
+            from isaac.plugins.spreadsheet import build_spreadsheet_tools
+            registry.update(build_spreadsheet_tools(self._config.cwd))
+        except Exception:
+            pass
+
         # App tools (loaded as plugin, not baked into core)
         try:
             from isaac.plugins.apps import build_app_tools
