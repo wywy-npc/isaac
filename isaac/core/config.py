@@ -26,6 +26,7 @@ def ensure_dirs() -> None:
     for d in (ISAAC_HOME, SOULS_DIR, TOOLS_DIR, SESSIONS_DIR, APPS_DIR, CHECKPOINTS_DIR, SKILLS_DIR, WIKIS_DIR, PERSONAL_DIR):
         d.mkdir(parents=True, exist_ok=True)
     _ensure_bundled_skills()
+    _ensure_bundled_souls()
 
 
 def _ensure_bundled_skills() -> None:
@@ -37,6 +38,17 @@ def _ensure_bundled_skills() -> None:
         target = SKILLS_DIR / skill_file.name
         if not target.exists():
             target.write_text(skill_file.read_text())
+
+
+def _ensure_bundled_souls() -> None:
+    """Copy bundled starter souls to SOULS_DIR if they don't exist."""
+    bundled_dir = Path(__file__).parent.parent / "data" / "souls"
+    if not bundled_dir.exists():
+        return
+    for soul_file in bundled_dir.glob("*.md"):
+        target = SOULS_DIR / soul_file.name
+        if not target.exists():
+            target.write_text(soul_file.read_text())
 
 
 def load_agents_config(path: Path | None = None) -> dict[str, AgentConfig]:

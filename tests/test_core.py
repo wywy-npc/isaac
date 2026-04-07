@@ -68,11 +68,11 @@ agents:
 
 class TestSoul:
     def test_platform_soul_exists(self):
-        assert "ISAAC" in PLATFORM_SOUL
+        assert "Isaac" in PLATFORM_SOUL
 
     def test_load_soul_returns_platform(self):
         soul = load_soul("nonexistent_soul")
-        assert "ISAAC" in soul
+        assert "Isaac" in soul
 
     def test_load_soul_with_file(self, tmp_path):
         from isaac.core import config as cfg
@@ -84,7 +84,7 @@ class TestSoul:
 
         soul = load_soul("test")
         assert "Test Soul" in soul
-        assert "ISAAC" in soul  # platform layer still there
+        assert "Isaac" in soul  # platform layer still there
 
         cfg.SOULS_DIR = original
 
