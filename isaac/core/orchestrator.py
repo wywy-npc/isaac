@@ -1,6 +1,13 @@
 """Agentic orchestrator — the brain. while stop_reason != end_turn, up to N iterations.
 
 Now uses LLMClient interface (no direct anthropic import) and ToolExecutor for concurrency.
+
+Integrates all 5 harness engineering pillars:
+  1. Tool Orchestration — ToolExecutor with concurrent safe, serial exclusive
+  2. Guardrails — pre-execution safety checks (destructive commands, budgets, freezes)
+  3. Error Recovery — retry with backoff, graceful degradation
+  4. Observability — structured telemetry for every action
+  5. Feedback Loops — loop detection, output validation, iteration budget warnings
 """
 from __future__ import annotations
 
@@ -19,9 +26,13 @@ from isaac.core.context import (
     truncate_tool_result,
 )
 from isaac.core.executor import ToolExecutor
+from isaac.core.feedback import FeedbackEngine
+from isaac.core.guardrails import GuardrailEngine, GuardrailVerdict
 from isaac.core.llm import LLMClient, LLMResult, StreamEvent
 from isaac.core.permissions import PermissionGate
+from isaac.core.recovery import RecoveryEngine
 from isaac.core.soul import load_soul
+from isaac.core.telemetry import TelemetryEngine
 from isaac.core.types import (
     AgentConfig,
     Handoff,
@@ -132,6 +143,40 @@ class ContinuationEvent(Event):
         self.what_remains = what_remains
 
 
+class GuardrailEvent(Event):
+    """A guardrail check fired (warn or block)."""
+    def __init__(self, verdict: str, reason: str, rule: str, tool_name: str = "") -> None:
+        self.verdict = verdict
+        self.reason = reason
+        self.rule = rule
+        self.tool_name = tool_name
+
+
+class RecoveryEvent(Event):
+    """A recovery action was taken (retry, degrade, fallback)."""
+    def __init__(self, strategy: str, tool_name: str, detail: str, recovered: bool) -> None:
+        self.strategy = strategy
+        self.tool_name = tool_name
+        self.detail = detail
+        self.recovered = recovered
+
+
+class FeedbackEvent(Event):
+    """A feedback signal was generated (loop detection, quality warning)."""
+    def __init__(self, feedback_type: str, message: str, severity: str) -> None:
+        self.feedback_type = feedback_type
+        self.message = message
+        self.severity = severity
+
+
+class AnomalyEvent(Event):
+    """An anomaly was detected (cost spike, stuck loop, error burst)."""
+    def __init__(self, anomaly_type: str, message: str, severity: str) -> None:
+        self.anomaly_type = anomaly_type
+        self.message = message
+        self.severity = severity
+
+
 class Orchestrator:
     """The agentic loop. Streams events. Handles tool calls, permissions, compaction.
 
@@ -150,6 +195,11 @@ class Orchestrator:
         soul_mode: str = "full",  # "full" for interactive, "minimal" for heartbeats
         soul_override: str = "",  # inject custom soul text (e.g. hatch mode)
         connector_registry: Any = None,  # ConnectorRegistry for soul awareness
+        # --- Harness pillars ---
+        guardrails: GuardrailEngine | None = None,
+        recovery: RecoveryEngine | None = None,
+        telemetry: TelemetryEngine | None = None,
+        feedback: FeedbackEngine | None = None,
     ) -> None:
         self.config = agent_config
         self.tools = tool_registry
@@ -160,6 +210,12 @@ class Orchestrator:
         self.approval_fn = approval_fn  # async (ToolCall) -> bool
         self.connector_registry = connector_registry
         self.executor = ToolExecutor()
+
+        # Harness pillars (all optional — graceful degradation)
+        self.guardrails = guardrails
+        self.recovery = recovery
+        self.telemetry = telemetry
+        self.feedback = feedback
 
         # LLM client — injected or auto-resolved
         if llm_client:
@@ -304,7 +360,17 @@ class Orchestrator:
         6. Conversation summary lives in session layer (cached between turns)
         7. Streaming LLM calls for real-time output
         8. Concurrent tool execution (safe tools run in parallel)
+
+        Harness pillars integrated at each stage:
+        - Guardrails: pre-tool check (destructive commands, budgets, freezes)
+        - Recovery: post-tool retry/degrade on failure
+        - Telemetry: record every LLM call, tool call, guardrail, recovery
+        - Feedback: loop detection, output validation, iteration budget warnings
         """
+        # Reset per-turn guardrail state
+        if self.guardrails:
+            self.guardrails.reset_turn()
+
         # --- PROACTIVE COMPACTION ON RESUME (self-chat pattern) ---
         is_resume = len(state.messages) > 0
 
@@ -315,6 +381,8 @@ class Orchestrator:
             if summary:
                 state.summary = summary
                 yield CompactEvent(summary)
+                if self.telemetry:
+                    self.telemetry.record_compaction(summary)
 
         # Build scout query — on resume, enrich with recent conversation context
         scout_query = user_message
@@ -376,6 +444,23 @@ class Orchestrator:
         for iteration in range(max_iter):
             elapsed = time.time() - loop_start
 
+            # --- FEEDBACK: iteration budget check ---
+            if self.feedback:
+                budget_signal = self.feedback.on_iteration(iteration, max_iter)
+                if budget_signal:
+                    yield FeedbackEvent(budget_signal.type, budget_signal.message, budget_signal.severity)
+                    # Inject feedback as system context for the agent
+                    state.messages.append(Message(
+                        role=Role.SYSTEM,
+                        content=f"[Harness feedback] {budget_signal.message}",
+                    ))
+
+            # --- FEEDBACK: drain pending signals from previous iteration ---
+            if self.feedback:
+                for signal in self.feedback.drain_pending():
+                    if signal.type != "budget_warning":  # already handled above
+                        yield FeedbackEvent(signal.type, signal.message, signal.severity)
+
             # --- PROGRESS CHECK-IN (every 3 iterations) ---
             if iteration > 0 and iteration % 3 == 0:
                 yield ProgressEvent(
@@ -386,6 +471,17 @@ class Orchestrator:
                 )
                 tools_used_since_checkin = []
 
+            # --- GUARDRAILS: time budget check ---
+            if self.guardrails:
+                from isaac.core.guardrails import check_time_budget
+                time_result = check_time_budget(elapsed, self.guardrails.budget)
+                if time_result.verdict == GuardrailVerdict.BLOCK:
+                    yield GuardrailEvent("block", time_result.reason, time_result.rule)
+                    if self.telemetry:
+                        self.telemetry.record_guardrail(time_result.rule, "block", time_result.reason, iteration)
+                    yield ErrorEvent(f"Time budget exceeded: {time_result.reason}")
+                    return
+
             # Check compaction
             if real_input_tokens > 0:
                 if real_input_tokens > self.config.context_budget * 0.8:
@@ -394,6 +490,8 @@ class Orchestrator:
                     )
                     state.summary = summary
                     yield CompactEvent(summary)
+                    if self.telemetry:
+                        self.telemetry.record_compaction(summary, iteration)
                     real_input_tokens = 0
             elif should_compact(state, self.config.context_budget):
                 state.messages, summary = await compact_messages(
@@ -401,6 +499,8 @@ class Orchestrator:
                 )
                 state.summary = summary
                 yield CompactEvent(summary)
+                if self.telemetry:
+                    self.telemetry.record_compaction(summary, iteration)
 
             # Build system prompt — memory only on iteration 1
             system_prompt = build_cached_system_prompt(
@@ -432,6 +532,7 @@ class Orchestrator:
             in_tok = out_tok = cache_read = cache_create = 0
 
             betas = ["computer-use-2025-01-24"] if self.config.computer_use else None
+            llm_start = time.time()
 
             try:
                 async for stream_event in self.llm.create_stream(
@@ -461,9 +562,16 @@ class Orchestrator:
             except Exception as e:
                 yield ThinkingEvent(active=False)
                 yield ErrorEvent(f"API error: {e}")
+                if self.telemetry:
+                    self.telemetry.record_llm_call(
+                        model=routed_model, input_tokens=0, output_tokens=0,
+                        cache_read=0, cost=0, latency_ms=int((time.time() - llm_start) * 1000),
+                        iteration=iteration,
+                    )
                 return
 
             yield ThinkingEvent(active=False)
+            llm_latency_ms = int((time.time() - llm_start) * 1000)
 
             real_input_tokens = in_tok
             total_cache_read += cache_read
@@ -480,12 +588,39 @@ class Orchestrator:
             state.total_cost += cost
             yield CostEvent(in_tok, out_tok, cost, cache_read, cache_create)
 
+            # --- TELEMETRY: record LLM call ---
+            if self.telemetry:
+                anomaly = self.telemetry.record_llm_call(
+                    model=routed_model, input_tokens=in_tok, output_tokens=out_tok,
+                    cache_read=cache_read, cost=cost, latency_ms=llm_latency_ms,
+                    iteration=iteration,
+                )
+                if anomaly:
+                    yield AnomalyEvent(anomaly.type, anomaly.message, anomaly.severity)
+
+            # --- GUARDRAILS: record cost for budget tracking ---
+            if self.guardrails:
+                self.guardrails.record_cost(cost)
+                cost_result = self.guardrails.check_tool_call("_llm_call", {}, state.total_cost)
+                if cost_result.verdict == GuardrailVerdict.BLOCK:
+                    yield GuardrailEvent("block", cost_result.reason, cost_result.rule)
+                    if self.telemetry:
+                        self.telemetry.record_guardrail(cost_result.rule, "block", cost_result.reason, iteration)
+                    yield ErrorEvent(f"Cost budget exceeded: {cost_result.reason}")
+                    return
+
             # Record assistant message
             state.messages.append(Message(
                 role=Role.ASSISTANT,
                 content=text,
                 tool_calls=tool_calls,
             ))
+
+            # --- FEEDBACK: validate response quality ---
+            if self.feedback and text:
+                resp_signal = self.feedback.on_response(text, iteration)
+                if resp_signal:
+                    yield FeedbackEvent(resp_signal.type, resp_signal.message, resp_signal.severity)
 
             # Done?
             if stop_reason == StopReason.END_TURN or not tool_calls:
@@ -505,12 +640,117 @@ class Orchestrator:
                 tool_calls, self.tools, _permission_check, self.approval_fn
             ):
                 if event_type == "call":
+                    # --- GUARDRAILS: pre-execution check ---
+                    if self.guardrails:
+                        gr = self.guardrails.check_tool_call(
+                            payload.name, payload.input, state.total_cost,
+                        )
+                        if gr.verdict == GuardrailVerdict.BLOCK:
+                            yield GuardrailEvent("block", gr.reason, gr.rule, payload.name)
+                            if self.telemetry:
+                                self.telemetry.record_guardrail(gr.rule, "block", gr.reason, iteration)
+                            results.append(ToolResult(
+                                tool_call_id=payload.id,
+                                content=f"[Blocked by guardrail] {gr.reason}",
+                                is_error=True,
+                            ))
+                            continue
+                        elif gr.verdict == GuardrailVerdict.WARN:
+                            yield GuardrailEvent("warn", gr.reason, gr.rule, payload.name)
+                            if self.telemetry:
+                                self.telemetry.record_guardrail(gr.rule, "warn", gr.reason, iteration)
+
+                    # --- TELEMETRY: record tool call ---
+                    if self.telemetry:
+                        anomaly = self.telemetry.record_tool_call(payload.name, payload.input, iteration)
+                        if anomaly:
+                            yield AnomalyEvent(anomaly.type, anomaly.message, anomaly.severity)
+
+                    # --- FEEDBACK: loop detection on tool call ---
+                    if self.feedback:
+                        fb_signal = self.feedback.on_tool_call(payload.name, payload.input, iteration)
+                        if fb_signal:
+                            yield FeedbackEvent(fb_signal.type, fb_signal.message, fb_signal.severity)
+                            # Inject loop warning into conversation
+                            state.messages.append(Message(
+                                role=Role.SYSTEM,
+                                content=f"[Harness feedback] {fb_signal.message}",
+                            ))
+
                     yield ToolCallEvent(payload)
+
                 elif event_type == "approval":
                     entry = self.tools.get(payload.name)
                     if entry:
                         yield ApprovalEvent(payload, entry[0])
+
                 elif event_type == "result":
+                    tool_start_time = time.time()  # approximate
+
+                    # --- RECOVERY: retry/degrade on failure ---
+                    if payload.is_error and self.recovery:
+                        entry = self.tools.get("")  # find the tool def
+                        # Find original tool call for this result
+                        original_tc = None
+                        for tc in tool_calls:
+                            if tc.id == payload.tool_call_id:
+                                original_tc = tc
+                                break
+
+                        if original_tc:
+                            recovered_result, recovery_evt = await self.recovery.execute_with_recovery(
+                                original_tc,
+                                lambda tc: self.executor._exec_one(tc, self.tools),
+                                tool_def=self.tools.get(original_tc.name, (None, None))[0] if original_tc.name in self.tools else None,
+                            )
+                            if recovery_evt:
+                                yield RecoveryEvent(
+                                    strategy=recovery_evt.strategy,
+                                    tool_name=recovery_evt.tool_name,
+                                    detail=recovery_evt.detail,
+                                    recovered=recovery_evt.recovered,
+                                )
+                                if self.telemetry:
+                                    self.telemetry.record_recovery(
+                                        f"{recovery_evt.strategy}: {recovery_evt.detail}", iteration,
+                                    )
+                                # Use recovered result instead
+                                payload = recovered_result
+
+                    # --- TELEMETRY: record tool result ---
+                    if self.telemetry:
+                        tool_name_for_telemetry = ""
+                        for tc in tool_calls:
+                            if tc.id == payload.tool_call_id:
+                                tool_name_for_telemetry = tc.name
+                                break
+                        anomaly = self.telemetry.record_tool_result(
+                            tool_name=tool_name_for_telemetry,
+                            success=not payload.is_error,
+                            error=payload.content if payload.is_error else "",
+                            iteration=iteration,
+                        )
+                        if anomaly:
+                            yield AnomalyEvent(anomaly.type, anomaly.message, anomaly.severity)
+
+                    # --- FEEDBACK: validate tool result ---
+                    if self.feedback:
+                        tool_name_for_fb = ""
+                        for tc in tool_calls:
+                            if tc.id == payload.tool_call_id:
+                                tool_name_for_fb = tc.name
+                                break
+                        fb_signal = self.feedback.on_tool_result(
+                            tool_name_for_fb, payload.content, payload.is_error, iteration,
+                        )
+                        # Error-based loop signals get injected
+                        if fb_signal and fb_signal.type == "loop_detected":
+                            yield FeedbackEvent(fb_signal.type, fb_signal.message, fb_signal.severity)
+                            state.messages.append(Message(
+                                role=Role.SYSTEM,
+                                content=f"[Harness feedback] {fb_signal.message}",
+                            ))
+
                     # Overflow preview — store full result for get_full_result tool
                     preview, overflowed = build_overflow_preview(payload.content)
                     if overflowed:

@@ -2,6 +2,13 @@
 
 Extracts the assembly logic from terminal.py into a reusable builder.
 CLI, SDK, gateway, delegation all use this to create HarnessCore instances.
+
+Assembles all 5 harness engineering pillars:
+  1. Tool Orchestration — built-in + plugins + delegation + connectors
+  2. Guardrails — destructive command detection, cost/time budgets, edit locks
+  3. Error Recovery — retry with backoff, graceful degradation
+  4. Observability — structured telemetry/audit trail
+  5. Feedback Loops — loop detection, output validation
 """
 from __future__ import annotations
 
@@ -9,14 +16,22 @@ import asyncio
 from typing import Any, Callable
 
 from isaac.core.config import load_agents_config
+from isaac.core.feedback import FeedbackEngine
+from isaac.core.guardrails import BudgetConfig, GuardrailEngine
 from isaac.core.harness import HarnessConfig, HarnessCore
 from isaac.core.llm import LLMClient
 from isaac.core.permissions import PermissionGate
+from isaac.core.recovery import LLMFallbackChain, RecoveryEngine, RetryPolicy
+from isaac.core.telemetry import TelemetryEngine
 from isaac.core.types import AgentConfig, PermissionLevel, ToolDef
 
 
 class HarnessBuilder:
-    """Fluent builder for HarnessCore. Replaces manual assembly in terminal.py."""
+    """Fluent builder for HarnessCore. Replaces manual assembly in terminal.py.
+
+    All 5 harness pillars are assembled automatically with sensible defaults.
+    Each can be customized via fluent methods.
+    """
 
     def __init__(self, agent_name: str = "default", cwd: str | None = None) -> None:
         agents = load_agents_config()
@@ -35,6 +50,17 @@ class HarnessBuilder:
         self._enable_delegation: bool = True
         self._enable_gateway: bool = True
         self._enable_sandbox: bool = True
+
+        # Harness pillar overrides (None = auto-create with defaults)
+        self._guardrails: GuardrailEngine | None = None
+        self._recovery: RecoveryEngine | None = None
+        self._telemetry: TelemetryEngine | None = None
+        self._feedback: FeedbackEngine | None = None
+        self._budget: BudgetConfig | None = None
+        self._enable_guardrails: bool = True
+        self._enable_recovery: bool = True
+        self._enable_telemetry: bool = True
+        self._enable_feedback: bool = True
 
     def with_config(self, config: AgentConfig) -> HarnessBuilder:
         """Override the agent config directly."""
@@ -87,6 +113,58 @@ class HarnessBuilder:
 
     def without_sandbox(self) -> HarnessBuilder:
         self._enable_sandbox = False
+        return self
+
+    # --- Harness pillar builders ---
+
+    def with_guardrails(self, engine: GuardrailEngine) -> HarnessBuilder:
+        """Provide a custom guardrail engine."""
+        self._guardrails = engine
+        return self
+
+    def with_budget(
+        self,
+        max_cost_per_turn: float = 0.0,
+        max_cost_per_session: float = 0.0,
+        max_time_seconds: int = 0,
+    ) -> HarnessBuilder:
+        """Set budget limits for guardrails."""
+        self._budget = BudgetConfig(
+            max_cost_per_turn=max_cost_per_turn,
+            max_cost_per_session=max_cost_per_session,
+            max_time_seconds=max_time_seconds,
+        )
+        return self
+
+    def with_recovery(self, engine: RecoveryEngine) -> HarnessBuilder:
+        """Provide a custom recovery engine."""
+        self._recovery = engine
+        return self
+
+    def with_telemetry(self, engine: TelemetryEngine) -> HarnessBuilder:
+        """Provide a custom telemetry engine."""
+        self._telemetry = engine
+        return self
+
+    def with_feedback(self, engine: FeedbackEngine) -> HarnessBuilder:
+        """Provide a custom feedback engine."""
+        self._feedback = engine
+        return self
+
+    def without_guardrails(self) -> HarnessBuilder:
+        self._enable_guardrails = False
+        return self
+
+    def without_recovery(self) -> HarnessBuilder:
+        self._enable_recovery = False
+        return self
+
+    def without_telemetry(self) -> HarnessBuilder:
+        self._enable_telemetry = False
+        return self
+
+    def without_feedback(self) -> HarnessBuilder:
+        self._enable_feedback = False
         return self
 
     def _resolve_llm_client(self) -> LLMClient:
@@ -626,6 +704,49 @@ class HarnessBuilder:
         if self._enable_gateway:
             connector_registry = await self._connect_mcp_services(registry)
 
+        # --- Assemble harness pillars ---
+        import uuid
+
+        session_id = str(uuid.uuid4())[:8]
+
+        # Pillar 2: Guardrails
+        guardrails = None
+        if self._enable_guardrails:
+            if self._guardrails:
+                guardrails = self._guardrails
+            else:
+                budget = self._budget or BudgetConfig(
+                    max_time_seconds=self._config.max_time_seconds,
+                )
+                guardrails = GuardrailEngine(budget=budget)
+
+        # Pillar 3: Recovery
+        recovery = None
+        if self._enable_recovery:
+            recovery = self._recovery or RecoveryEngine()
+
+        # Pillar 4: Telemetry
+        telemetry = None
+        if self._enable_telemetry:
+            if self._telemetry:
+                telemetry = self._telemetry
+            else:
+                import os
+                log_dir = os.path.join(
+                    os.environ.get("ISAAC_HOME", os.path.expanduser("~/.isaac")),
+                    "telemetry",
+                )
+                telemetry = TelemetryEngine(
+                    session_id=session_id,
+                    agent_name=self._config.name,
+                    log_dir=log_dir,
+                )
+
+        # Pillar 5: Feedback
+        feedback = None
+        if self._enable_feedback:
+            feedback = self._feedback or FeedbackEngine()
+
         config = HarnessConfig(
             agent_config=self._config,
             tool_registry=registry,
@@ -639,6 +760,11 @@ class HarnessBuilder:
             sandbox_session=sandbox_session,
             sandbox_backend=sandbox_backend,
             connector_registry=connector_registry,
+            # Harness pillars
+            guardrails=guardrails,
+            recovery=recovery,
+            telemetry=telemetry,
+            feedback=feedback,
         )
 
         return HarnessCore(config)
